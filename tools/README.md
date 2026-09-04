@@ -17,3 +17,14 @@
 - 实现方式：Open WebUI Workspace Tool（Python，结构化 JSON 输出）。
 - 安装：在 Open WebUI 工作空间 → 工具中新建工具，粘贴 `chapter_query_tool.py` 内容；默认数据路径为 `E:\ai_assistant\course-ai-assistant\knowledge-base`，可在工具“Valves”设置里修改。
 - 启用：在“Python程序设计基础 AI 助教”模型设置中启用该工具。
+
+## 已完成：随机抽题 + 客观题判分工具（quiz）
+
+- 文件：`tools/quiz_tools.py`
+- 数据：`tools/question_bank.json`（结构化题库，含题目 id/章节/类型/难度/选项/答案/解析）
+- 功能：
+  - `random_questions(chapter, count, include_answer)`：按章节随机抽题，默认不返回答案；
+  - `grade_objective(answers)`：批量判分单选题/判断题，返回得分、总分、正确率与逐题判定；
+  - `list_bank_chapters()`：列出题库中已有章节与题量。
+- 实现方式：Open WebUI Workspace Tool（真实读取题库 JSON、随机抽样、规则判分，非提示词模拟）。
+- 安装：在工作空间 → 工具中新建工具，粘贴 `quiz_tools.py`；确保部署机存在 `tools/question_bank.json`，库存路径可在 Valves 中修改。
