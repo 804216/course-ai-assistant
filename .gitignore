@@ -3,12 +3,37 @@
 *.env
 !*.env.example
 
-# 本地部署运行时（含密钥、向量库、上传文件、虚拟环境，不入库）
-open-webui/local-deploy/
-
 # 运行时数据（不纳入版本库）
 data/
 open-webui-data/
+
+# 本地部署运行时：默认忽略，只提交可直接使用的课程知识库 v3。
+open-webui/local-deploy/*
+!open-webui/local-deploy/data/
+open-webui/local-deploy/data/*
+!open-webui/local-deploy/data/course_kb/
+open-webui/local-deploy/data/course_kb/*
+!open-webui/local-deploy/data/course_kb/active.json
+!open-webui/local-deploy/data/course_kb/builds/
+open-webui/local-deploy/data/course_kb/builds/*
+!open-webui/local-deploy/data/course_kb/builds/20260904-v3/
+!open-webui/local-deploy/data/course_kb/builds/20260904-v3/**
+
+# 固化与 v3 向量库匹配的嵌入模型快照；blobs 和未完成下载仍忽略。
+!open-webui/local-deploy/data/cache/
+open-webui/local-deploy/data/cache/*
+!open-webui/local-deploy/data/cache/huggingface/
+open-webui/local-deploy/data/cache/huggingface/*
+!open-webui/local-deploy/data/cache/huggingface/hub/
+open-webui/local-deploy/data/cache/huggingface/hub/*
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/
+open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/*
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/refs/
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/refs/main
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/
+open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/*
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42/
+!open-webui/local-deploy/data/cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42/**
 
 # 系统文件
 .DS_Store
@@ -31,3 +56,7 @@ node_modules/
 # 日志与临时文件
 *.log
 ~$*.docx
+
+# 本地测试记录与未纳入仓库的原始题目
+/test.md
+/2. 李正丹-朱静雯老师的题目.docx

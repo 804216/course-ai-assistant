@@ -7,6 +7,7 @@ import logging
 import time
 import uuid
 import zipfile
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -14,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, RAG_EMBEDDING_CONTENT_PREFIX
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.env import DATA_DIR
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
@@ -500,7 +502,7 @@ class ExternalKnowledgeConnectionListResponse(BaseModel):
 
 
 EXTERNAL_KNOWLEDGE_CONNECTIONS_CONFIG_KEY = 'external_knowledge.connections'
-EXTERNAL_KNOWLEDGE_PROVIDERS = {'qdrant', 'milvus', 'pgvector'}
+EXTERNAL_KNOWLEDGE_PROVIDERS = {'qdrant', 'milvus', 'pgvector', 'chroma'}
 
 
 def _validate_external_connection_form(form_data: ExternalKnowledgeConnectionForm) -> tuple[str, dict]:
@@ -522,11 +524,21 @@ def _validate_external_connection_form(form_data: ExternalKnowledgeConnectionFor
     if provider == 'milvus':
         allowed_config_keys.add('db_name')
 
+    if provider == 'chroma':
+        try:
+            endpoint = Path(form_data.endpoint).expanduser().resolve()
+            endpoint.relative_to(Path(DATA_DIR).resolve())
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f'Local Chroma path must be inside DATA_DIR: {Path(DATA_DIR).resolve()}',
+            ) from exc
+
     return provider, {key: value for key, value in config.items() if key in allowed_config_keys}
 
 
 def _external_auth_config(provider: str, incoming: Optional[dict], existing: Optional[dict] = None) -> dict:
-    if provider == 'pgvector':
+    if provider in {'pgvector', 'chroma'}:
         return {}
     return existing if incoming is None else incoming or {}
 
@@ -553,6 +565,8 @@ def _normalize_external_source(source: ExternalKnowledgeSourceForm, provider: st
         if key in allowed_keys and value is not None and (not isinstance(value, str) or value.strip())
     }
 
+    if provider == 'chroma' and not normalized_config.get('content_field'):
+        normalized_config['content_field'] = 'document'
     if not normalized_config.get('content_field'):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Content field is required.')
     if provider in {'milvus', 'pgvector'} and not normalized_config.get('vector_field'):
