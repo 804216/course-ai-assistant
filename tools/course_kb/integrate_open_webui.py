@@ -17,6 +17,9 @@ SOLUTION_KNOWLEDGE_NAME = "Python课程参考答案（受控）"
 ASSISTANT_ID = "python-course-ai-optimized"
 ASSISTANT_NAME = "Python程序设计基础 AI 助教（优化版）"
 COURSE_TOOL_ID = "python_course_learning"
+CHAPTER_TOOL_ID = "chapter_query"
+QUIZ_TOOL_ID = "quiz"
+ASSISTANT_TOOL_IDS = [COURSE_TOOL_ID, CHAPTER_TOOL_ID, QUIZ_TOOL_ID]
 LANGGRAPH_PIPE_ID = "python_course_langgraph"
 PUBLIC_READ_GRANT = {
     "principal_type": "user",
@@ -163,21 +166,26 @@ def upsert_external_knowledge(
     return result
 
 
-def upsert_course_tool(base_url: str, token: str, content: str) -> dict[str, Any]:
+def upsert_tool(
+    base_url: str,
+    token: str,
+    tool_id: str,
+    name: str,
+    description: str,
+    content: str,
+) -> dict[str, Any]:
     payload = {
-        "id": COURSE_TOOL_ID,
-        "name": "Python课程学习工具",
+        "id": tool_id,
+        "name": name,
         "content": content,
-        "meta": {
-            "description": "查询课程章节目录、列出章节资料，并从指定章节抽取练习题材料。",
-        },
+        "meta": {"description": description},
         "access_grants": [PUBLIC_READ_GRANT],
     }
     existing = request_json(
         base_url,
         token,
         "GET",
-        f"/api/v1/tools/id/{COURSE_TOOL_ID}",
+        f"/api/v1/tools/id/{tool_id}",
         allow_not_found=True,
     )
     if existing:
@@ -185,7 +193,7 @@ def upsert_course_tool(base_url: str, token: str, content: str) -> dict[str, Any
             base_url,
             token,
             "POST",
-            f"/api/v1/tools/id/{COURSE_TOOL_ID}/update",
+            f"/api/v1/tools/id/{tool_id}/update",
             payload,
         )
         print(f"Updated course tool: {result['name']} ({result['id']})")
@@ -193,6 +201,17 @@ def upsert_course_tool(base_url: str, token: str, content: str) -> dict[str, Any
     result = request_json(base_url, token, "POST", "/api/v1/tools/create", payload)
     print(f"Created course tool: {result['name']} ({result['id']})")
     return result
+
+
+def upsert_course_tool(base_url: str, token: str, content: str) -> dict[str, Any]:
+    return upsert_tool(
+        base_url,
+        token,
+        COURSE_TOOL_ID,
+        "Python课程学习工具",
+        "查询课程章节目录、列出章节资料，并从指定章节抽取练习题材料。",
+        content,
+    )
 
 
 def upsert_langgraph_pipe(base_url: str, token: str, content: str) -> dict[str, Any]:
@@ -240,6 +259,7 @@ def upsert_assistant(
     base_model_id: str,
     knowledge: dict[str, Any],
     prompt: str,
+    tool_ids: list[str],
 ) -> dict[str, Any]:
     payload = {
         "id": ASSISTANT_ID,
@@ -257,7 +277,7 @@ def upsert_assistant(
                     "description": knowledge.get("description") or knowledge["name"],
                 }
             ],
-            "toolIds": [COURSE_TOOL_ID],
+            "toolIds": tool_ids,
             "agent": {
                 "version": "1.0.0",
                 "strategy": "open-webui-native-tool-calling",
@@ -349,10 +369,37 @@ def main(argv: list[str] | None = None) -> int:
         "第3章程序控制结构习题的参考答案",
     )
 
-    tool_path = project_root / "tools" / "course_agent" / "course_learning_tools.py"
-    tool = upsert_course_tool(
-        args.base_url, token, tool_path.read_text(encoding="utf-8")
-    )
+    tool_definitions = [
+        (
+            COURSE_TOOL_ID,
+            "Python课程学习工具",
+            "查询课程章节目录、列出章节资料，并从指定章节抽取练习题材料。",
+            project_root / "tools" / "course_agent" / "course_learning_tools.py",
+        ),
+        (
+            CHAPTER_TOOL_ID,
+            "Python课程章节查询工具",
+            "按章节号或章节名查询讲义、题目、答案和示例代码文件清单。",
+            project_root / "tools" / "chapter_query_tool.py",
+        ),
+        (
+            QUIZ_TOOL_ID,
+            "Python课程随机抽题与判分工具",
+            "按章节随机抽题、统计题库章节，并对单选题和判断题进行规则判分。",
+            project_root / "tools" / "quiz_tools.py",
+        ),
+    ]
+    tools = [
+        upsert_tool(
+            args.base_url,
+            token,
+            tool_id,
+            name,
+            description,
+            path.read_text(encoding="utf-8"),
+        )
+        for tool_id, name, description, path in tool_definitions
+    ]
 
     pipe_path = project_root / "tools" / "course_agent" / "langgraph_pipe.py"
     langgraph_pipe = upsert_langgraph_pipe(
@@ -366,13 +413,15 @@ def main(argv: list[str] | None = None) -> int:
         args.base_model_id,
         core,
         prompt_path.read_text(encoding="utf-8").strip(),
+        [tool["id"] for tool in tools],
     )
     print(
         json.dumps(
             {
                 "build_id": active["build_id"],
                 "core_knowledge_id": core["id"],
-                "course_tool_id": tool["id"],
+                "course_tool_id": tools[0]["id"],
+                "course_tool_ids": [tool["id"] for tool in tools],
                 "langgraph_pipe_id": langgraph_pipe["id"],
                 "langgraph_pipe_active": langgraph_pipe["is_active"],
                 "assistant_id": assistant["id"],

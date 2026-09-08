@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from integrate_open_webui import (
+    ASSISTANT_TOOL_IDS,
     ASSISTANT_ID,
+    CHAPTER_TOOL_ID,
     COURSE_TOOL_ID,
     LANGGRAPH_PIPE_ID,
+    QUIZ_TOOL_ID,
     local_admin_token,
     request_json,
     source_payload,
@@ -206,9 +209,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             "SELECT id, name, base_model_id, meta FROM model WHERE id=?",
             (ASSISTANT_ID,),
         ).fetchone()
-        course_tool = database.execute(
-            "SELECT id, name, specs FROM tool WHERE id=?", (COURSE_TOOL_ID,)
-        ).fetchone()
+        course_tools = database.execute(
+            "SELECT id, name, specs FROM tool WHERE id IN (?, ?, ?)",
+            tuple(ASSISTANT_TOOL_IDS),
+        ).fetchall()
         langgraph_pipe = database.execute(
             "SELECT id, name, type, is_active FROM function WHERE id=?",
             (LANGGRAPH_PIPE_ID,),
@@ -222,7 +226,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     if (
         len(optimized_knowledge) != 2
         or not assistant
-        or not course_tool
+        or len(course_tools) != len(ASSISTANT_TOOL_IDS)
         or not langgraph_pipe
     ):
         raise RuntimeError("优化知识库、助教、课程工具或LangGraph Pipe尚未完整注册")
@@ -242,7 +246,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     bound_ids = [item.get("id") for item in assistant_meta.get("knowledge", [])]
     if bound_ids != [core_id]:
         raise RuntimeError(f"助教知识库绑定不符合预期：{bound_ids}")
-    if assistant_meta.get("toolIds") != [COURSE_TOOL_ID]:
+    if assistant_meta.get("toolIds") != ASSISTANT_TOOL_IDS:
         raise RuntimeError(f"助教工具绑定不符合预期：{assistant_meta.get('toolIds')}")
 
     with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as database:
@@ -252,28 +256,36 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
                 """
                 SELECT resource_type, resource_id FROM access_grant
                 WHERE principal_type='user' AND principal_id='*' AND permission='read'
-                  AND resource_id IN (?, ?, ?)
+                  AND resource_id IN (?, ?, ?, ?, ?)
                 """,
-                (ASSISTANT_ID, COURSE_TOOL_ID, core_id),
+                (ASSISTANT_ID, *ASSISTANT_TOOL_IDS, core_id),
             ).fetchall()
         }
     expected_public = {
         ("model", ASSISTANT_ID),
         ("tool", COURSE_TOOL_ID),
+        ("tool", CHAPTER_TOOL_ID),
+        ("tool", QUIZ_TOOL_ID),
         ("knowledge", core_id),
     }
     if public_grants != expected_public:
         raise RuntimeError(f"智能体公共只读授权不符合预期：{public_grants}")
 
-    tool_specs = json_value(course_tool[2])
-    tool_names = sorted(spec.get("name") for spec in tool_specs)
-    expected_tools = [
-        "get_chapter_materials",
-        "get_course_outline",
-        "sample_chapter_exercises",
-    ]
-    if tool_names != expected_tools:
-        raise RuntimeError(f"课程工具函数不符合预期：{tool_names}")
+    expected_tool_functions = {
+        COURSE_TOOL_ID: [
+            "get_chapter_materials",
+            "get_course_outline",
+            "sample_chapter_exercises",
+        ],
+        CHAPTER_TOOL_ID: ["list_chapters", "query_chapter"],
+        QUIZ_TOOL_ID: ["grade_objective", "list_bank_chapters", "random_questions"],
+    }
+    registered_tool_functions = {
+        tool_id: sorted(spec.get("name") for spec in json_value(specs))
+        for tool_id, _name, specs in course_tools
+    }
+    if registered_tool_functions != expected_tool_functions:
+        raise RuntimeError(f"课程工具函数不符合预期：{registered_tool_functions}")
 
     token = args.token or local_admin_token(data_dir, Path(args.secret_file).resolve())
     health = request_json(args.base_url, token, "GET", "/health")
@@ -282,11 +294,12 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("优化版助教未出现在前端模型列表中")
     if LANGGRAPH_PIPE_ID not in {model.get("id") for model in models}:
         raise RuntimeError("LangGraph助教未出现在前端模型列表中")
-    tool_api = request_json(
-        args.base_url, token, "GET", f"/api/v1/tools/id/{COURSE_TOOL_ID}"
-    )
-    if tool_api.get("id") != COURSE_TOOL_ID:
-        raise RuntimeError("课程工具未出现在 Open WebUI 工具接口中")
+    for tool_id in ASSISTANT_TOOL_IDS:
+        tool_api = request_json(
+            args.base_url, token, "GET", f"/api/v1/tools/id/{tool_id}"
+        )
+        if tool_api.get("id") != tool_id:
+            raise RuntimeError(f"课程工具未出现在 Open WebUI 工具接口中：{tool_id}")
 
     import sys
 
@@ -361,8 +374,8 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             "base_model_id": assistant[2],
         },
         "agent_tools": {
-            "tool_id": course_tool[0],
-            "functions": tool_names,
+            "tool_ids": ASSISTANT_TOOL_IDS,
+            "functions": registered_tool_functions,
             "chapter_count": len(outline["chapters"]),
             "chapter_6_code_chunks": materials["chunk_counts"]["code"],
             "sampled_exercises": exercises["count"],
