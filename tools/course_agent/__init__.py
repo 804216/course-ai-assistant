@@ -1,0 +1,1 @@
+"""Course assistant integration helpers."""

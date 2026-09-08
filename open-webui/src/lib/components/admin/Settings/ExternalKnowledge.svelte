@@ -87,6 +87,16 @@
 	};
 
 	const schemaDefaults = (provider = sourceForm.provider) => {
+		if (provider === 'chroma') {
+			return {
+				contentField: 'document',
+				vectorField: '',
+				metadataField: 'metadata',
+				documentIdField: 'file_id',
+				tableName: 'document_chunk',
+				collectionField: 'collection_name'
+			};
+		}
 		if (provider === 'milvus') {
 			return {
 				contentField: 'data.text',
@@ -198,6 +208,9 @@
 	};
 
 	const endpointPlaceholder = () => {
+		if (sourceForm.provider === 'chroma') {
+			return 'D:\\path\\inside\\open-webui\\local-deploy\\data\\course_kb\\builds\\...\\vector_db';
+		}
 		if (sourceForm.provider === 'pgvector') {
 			return 'postgresql://user:password@host:5432/db';
 		}
@@ -218,7 +231,7 @@
 		provider: sourceForm.provider,
 		endpoint: sourceForm.endpoint,
 		auth_config:
-			sourceForm.provider === 'pgvector'
+			sourceForm.provider === 'pgvector' || sourceForm.provider === 'chroma'
 				? {}
 				: sourceForm.apiKey
 					? { type: 'bearer', api_key: sourceForm.apiKey }
@@ -263,7 +276,7 @@
 		!!sourceForm.endpoint.trim() &&
 		!!sourceForm.sourceName.trim() &&
 		!!sourceForm.contentField.trim() &&
-		(sourceForm.provider === 'qdrant' || !!sourceForm.vectorField.trim()) &&
+		(['qdrant', 'chroma'].includes(sourceForm.provider) || !!sourceForm.vectorField.trim()) &&
 		(sourceForm.provider !== 'pgvector' ||
 			(!!sourceForm.tableName.trim() && !!sourceForm.collectionField.trim())) &&
 		!!sourceForm.testQuery.trim();
@@ -469,6 +482,7 @@
 										<option value="qdrant">Qdrant</option>
 										<option value="milvus">Milvus</option>
 										<option value="pgvector">pgvector</option>
+										<option value="chroma">Chroma (Local)</option>
 									</SettingsSelect>
 								</div>
 							</div>
@@ -524,7 +538,7 @@
 								</div>
 							</div>
 
-							{#if sourceForm.provider !== 'pgvector'}
+							{#if sourceForm.provider !== 'pgvector' && sourceForm.provider !== 'chroma'}
 								<div class="flex flex-col flex-1">
 									<div class="flex justify-between mb-0.5">
 										<label class="text-xs text-gray-500" for="external-source-api-key"
@@ -659,8 +673,10 @@
 										class="w-full text-sm bg-transparent outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700"
 										bind:value={sourceForm.vectorField}
 										on:input={markUntested}
-										placeholder={sourceForm.provider === 'qdrant' ? $i18n.t('Default') : 'vector'}
-										required={sourceForm.provider !== 'qdrant'}
+										placeholder={['qdrant', 'chroma'].includes(sourceForm.provider)
+											? $i18n.t('Default')
+											: 'vector'}
+										required={!['qdrant', 'chroma'].includes(sourceForm.provider)}
 									/>
 								</div>
 							</div>

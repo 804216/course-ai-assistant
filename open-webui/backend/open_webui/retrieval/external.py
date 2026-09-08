@@ -2,9 +2,11 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
+from open_webui.env import DATA_DIR
 from open_webui.models.config import Config
 from open_webui.models.knowledge import KnowledgeModel
 
@@ -289,6 +291,84 @@ async def _retrieve_pgvector(connection, auth_config, knowledge, query, count, e
     return [_normalize_result(row, mapping, knowledge, distance=row.get('distance')) for row in rows]
 
 
+def _local_chroma_path(endpoint: str) -> Path:
+    """Resolve a local Chroma endpoint without allowing reads outside DATA_DIR."""
+    path = Path(endpoint).expanduser().resolve()
+    data_root = Path(DATA_DIR).resolve()
+    try:
+        path.relative_to(data_root)
+    except ValueError as exc:
+        raise RuntimeError(f'Local Chroma path must be inside DATA_DIR: {data_root}') from exc
+    if not path.is_dir():
+        raise RuntimeError(f'Local Chroma path does not exist: {path}')
+    return path
+
+
+def _chapter_filter_from_query(query: str) -> Optional[dict]:
+    match = re.search(r'(?:第\s*)?(\d{1,2})\s*章', query, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r'chapter\s*0?(\d{1,2})\b', query, flags=re.IGNORECASE)
+    if match:
+        chapter_no = int(match.group(1))
+        if 1 <= chapter_no <= 15:
+            return {'chapter_no': chapter_no}
+    return None
+
+
+async def _retrieve_chroma(connection, auth_config, knowledge, query, count, embedding_function) -> list[dict]:
+    """Retrieve from a read-only, separately built local Chroma collection."""
+    try:
+        import chromadb
+    except ImportError as exc:
+        raise RuntimeError('chromadb is not installed') from exc
+
+    if not embedding_function:
+        raise RuntimeError('Embedding function is not configured')
+
+    external = (knowledge.meta or {}).get('external', {})
+    source = external.get('source') or {}
+    collection_name = source.get('name')
+    if not collection_name:
+        raise RuntimeError('Chroma collection is not configured')
+
+    path = _local_chroma_path(connection.get('endpoint') or '')
+    vector = await embedding_function(query, prefix=RAG_EMBEDDING_QUERY_PREFIX)
+    where = _chapter_filter_from_query(query)
+
+    def _search():
+        client = chromadb.PersistentClient(path=str(path))
+        collection = client.get_collection(name=collection_name)
+        return collection.query(
+            query_embeddings=[vector],
+            n_results=count,
+            where=where,
+            include=['documents', 'metadatas', 'distances'],
+        )
+
+    response = await asyncio.to_thread(_search)
+    documents = (response.get('documents') or [[]])[0]
+    metadatas = (response.get('metadatas') or [[]])[0]
+    distances = (response.get('distances') or [[]])[0]
+    normalized = []
+    for idx, content in enumerate(documents):
+        metadata = dict(metadatas[idx] or {}) if idx < len(metadatas) else {}
+        cosine_distance = distances[idx] if idx < len(distances) else None
+        score = None if cosine_distance is None else max(0.0, min(1.0, 1.0 - cosine_distance / 2.0))
+        source_name = metadata.get('source') or metadata.get('source_path') or knowledge.name
+        metadata.update(
+            {
+                'name': source_name,
+                'source': source_name,
+                'file_id': metadata.get('file_id') or f'external-{knowledge.id}',
+                'knowledge_id': knowledge.id,
+                'knowledge_name': knowledge.name,
+                'external': True,
+            }
+        )
+        normalized.append({'content': content, 'metadata': metadata, 'distance': score})
+    return normalized
+
+
 async def retrieve_external_knowledge(
     request,
     knowledge: KnowledgeModel,
@@ -350,6 +430,17 @@ async def retrieve_external_knowledge_for_connection(
         elif provider == 'pgvector':
             chunks.extend(
                 await _retrieve_pgvector(
+                    connection,
+                    auth_config,
+                    knowledge,
+                    query,
+                    count,
+                    getattr(request.app.state, 'EMBEDDING_FUNCTION', None),
+                )
+            )
+        elif provider == 'chroma':
+            chunks.extend(
+                await _retrieve_chroma(
                     connection,
                     auth_config,
                     knowledge,
