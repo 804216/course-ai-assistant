@@ -14,12 +14,27 @@ from pydantic import BaseModel, Field
 class Tools:
     class Valves(BaseModel):
         bank_path: str = Field(
-            default=r"E:\ai_assistant\course-ai-assistant\tools\question_bank.json",
-            description="结构化题库 JSON 文件路径",
+            default="",
+            description="结构化题库 JSON 文件路径；留空时自动从运行目录向上查找 tools/question_bank.json",
         )
 
     def __init__(self):
         self.valves = self.Valves()
+
+    def _resolve_bank(self) -> str:
+        """返回题库路径：优先 Valves，其次从运行目录向上自动定位。"""
+        path = (self.valves.bank_path or "").strip()
+        if path:
+            return path
+        current = os.path.abspath(os.getcwd())
+        while True:
+            cand = os.path.join(current, "tools", "question_bank.json")
+            if os.path.isfile(cand):
+                return cand
+            parent = os.path.dirname(current)
+            if parent == current:
+                return cand
+            current = parent
 
     def random_questions(self, chapter: str = "全部", count: int = 3, include_answer: bool = False) -> str:
         """从结构化题库中随机抽取题目（默认不返回答案）。
@@ -106,7 +121,7 @@ class Tools:
         return json.dumps({"chapters": chapters, "total_questions": len(items)}, ensure_ascii=False, indent=2)
 
     def _load_bank(self) -> list:
-        path = self.valves.bank_path
+        path = self._resolve_bank()
         if not os.path.isfile(path):
             return []
         try:
@@ -133,3 +148,6 @@ class Tools:
             if matched:
                 return matched
         return [q for q in items if text in q["chapter"] or text in q.get("question", "")]
+
+
+

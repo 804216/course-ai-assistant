@@ -17,16 +17,34 @@ class Tools:
     class Valves(BaseModel):
         # 部署机上知识库归档目录（仓库里的 knowledge-base），可自行调整
         base_path: str = Field(
-            default=r"E:\ai_assistant\course-ai-assistant\knowledge-base",
-            description="知识库归档根目录",
+            default="",
+            description="知识库归档根目录；留空时自动从运行目录向上查找仓库 knowledge-base",
         )
 
     def __init__(self):
         self.valves = self.Valves()
 
+    def _resolve_base(self) -> str:
+        """返回知识库根目录：优先 Valves，其次从运行目录向上自动定位。"""
+        root = (self.valves.base_path or "").strip()
+        if root:
+            return root
+        current = os.path.abspath(os.getcwd())
+        while True:
+            cand = os.path.join(current, "knowledge-base")
+            if os.path.isdir(cand) and any(
+                name.startswith("第") and os.path.isdir(os.path.join(cand, name))
+                for name in os.listdir(cand)
+            ):
+                return cand
+            parent = os.path.dirname(current)
+            if parent == current:
+                return cand
+            current = parent
+
     def list_chapters(self) -> str:
         """列出课程全部章节编号与名称，供学生/助教查询各章资料时使用。"""
-        root = self.valves.base_path
+        root = self._resolve_base()
         if not os.path.isdir(root):
             return json.dumps(
                 {"error": f"知识库目录不存在: {root}"}, ensure_ascii=False
@@ -56,7 +74,7 @@ class Tools:
         Returns:
             JSON 字符串，包含该章目录、讲义/题目/答案 PDF 与示例代码文件列表。
         """
-        root = self.valves.base_path
+        root = self._resolve_base()
         if not os.path.isdir(root):
             return json.dumps(
                 {"error": f"知识库目录不存在: {root}"}, ensure_ascii=False
@@ -132,3 +150,5 @@ class Tools:
             if text in d or d in text:
                 return d
         return None
+
+
