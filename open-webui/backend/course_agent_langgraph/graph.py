@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field, ValidationError
 
 from .course_data import CHAPTER_TITLES, CourseData, normalize_resource_type
 from .model_gateway import invoke_base_model
-from .retrieval import retrieve_core_chunks
+from .prompts import load_course_system_prompt
+from .retrieval import _bm25_tokenize, retrieve_core_chunks
 from .state import CourseAgentState, CourseIntent
+
+log = logging.getLogger(__name__)
 
 
 class IntentDecision(BaseModel):
@@ -32,6 +37,40 @@ def _message_text(content: Any) -> str:
             block.get('text', '') for block in content if isinstance(block, dict) and block.get('type') == 'text'
         )
     return str(content or '')
+
+
+def _evidence_page_label(chunk: dict[str, Any]) -> str:
+    page_start = chunk.get('page_start')
+    page_end = chunk.get('page_end')
+    if page_start and page_end and page_end != page_start:
+        return f'{page_start}-{page_end}'
+    return str(page_start or '未知')
+
+
+def _evidence_locator(chunk: dict[str, Any]) -> str:
+    line_start = chunk.get('line_start')
+    line_end = chunk.get('line_end')
+    if line_start:
+        if line_end and line_end != line_start:
+            return f'行号={line_start}-{line_end}'
+        return f'行号={line_start}'
+    page = _evidence_page_label(chunk)
+    return f'页码={page}' if page != '未知' else '位置=未知'
+
+
+def _source_label(chunk: dict[str, Any]) -> str:
+    source = str(chunk.get('source') or '课程知识库')
+    line = chunk.get('line_start')
+    line_end = chunk.get('line_end')
+    if line:
+        position = f'，第{line}-{line_end}行' if line_end and line_end != line else f'，第{line}行'
+        return f'{source}{position}'
+    page = chunk.get('page_start')
+    page_end = chunk.get('page_end')
+    if page:
+        position = f'，第{page}-{page_end}页' if page_end and page_end != page else f'，第{page}页'
+        return f'{source}{position}'
+    return source
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -84,14 +123,51 @@ def _detect_resource_type(query: str) -> str:
 
 
 def _detect_level(query: str) -> str:
-    if any(word in query for word in ('零基础', '小白', '没学过')):
+    compact = re.sub(r'\s+', '', query).lower()
+    if any(word in compact for word in ('零基础', '小白', '没学过', '第一次学', '完全不会')):
         return '零基础'
-    if any(word in query for word in ('考试', '备考', '复习', '提高')):
+    if any(word in compact for word in ('考试', '备考', '复习', '考前', '刷题')):
         return '备考复习'
+    if any(word in compact for word in ('进阶', '深入', '高级', '有基础', '熟练', '原理层面')):
+        return '进阶学习者'
     return '初学者'
 
 
+def _level_guidance(level: str) -> str:
+    return {
+        '零基础': '避免未解释术语；一次只讲一个核心点；使用生活类比和最小可运行示例。',
+        '初学者': '先直观解释，再给正式概念；示例保持简短，并说明每个关键步骤。',
+        '进阶学习者': '可以使用准确术语；补充机制、边界条件、常见陷阱和方案比较。',
+        '备考复习': '突出考点、易错点和自测方法；结尾给出简短记忆线索。',
+    }.get(level, '先直观解释，再给正式概念，并根据学生反馈调整深度。')
+
+
+def _is_whole_assignment_request(query: str) -> bool:
+    compact = re.sub(r'\s+', '', query)
+    if re.search(r'(?:不要|别|无需).{0,6}(?:直接|完整)?(?:答案|解答|代写)', compact):
+        return False
+    patterns = (
+        r'(?:代写|替我完成|帮我完成|帮我写完|替我做完).{0,12}(?:作业|习题|题目|实验报告|课程设计)',
+        r'(?:整份|整套|全部|所有).{0,12}(?:作业|习题|题目|实验报告).{0,12}(?:答案|解答|代码|做完|完成)',
+        r'(?:直接给|发给我|只要).{0,10}(?:整份|整套|全部|所有).{0,12}(?:答案|解答|代码)',
+    )
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in patterns)
+
+
 def _deterministic_intent(query: str) -> CourseIntent | None:
+    compact = re.sub(r'\s+', '', query).lower()
+    course_framing = any(
+        word in compact
+        for word in ('python', '代码', '程序', '编程', '爬虫', '数据库', '正则', '算法', '函数')
+    )
+    obvious_external = bool(
+        re.search(
+            r'(?:今天|今日|最新|实时).{0,10}(?:足球|篮球|比赛|体育|新闻|天气|股价|股票|汇率)',
+            compact,
+        )
+    )
+    if obvious_external and not course_framing:
+        return 'out_of_scope'
     if any(word in query for word in ('批改', '分析我的答案', '检查我的答案', '我的答案', '我写的代码')):
         return 'answer_review'
     if any(word in query for word in ('抽题', '出题', '练习题', '自测题', '生成题')):
@@ -155,15 +231,83 @@ def _needs_context_rewrite(query: str, history_context: str) -> bool:
     )
 
 
+_EVIDENCE_GENERIC_TOKENS = {
+    'python', '课程', '资料', '请问', '回答', '解释', '说明', '给出', '一下',
+    '什么', '怎么', '如何', '哪些', '中的', '根据', '依据',
+}
+
+
+def _evidence_metrics(
+    query: str,
+    chunks: list[dict[str, Any]],
+) -> tuple[float, float, bool]:
+    """Return top rerank score, lexical coverage and whether reranking ran."""
+    rerank_scores = [
+        float(chunk['rerank_score'])
+        for chunk in chunks
+        if chunk.get('rerank_score') is not None
+    ]
+    fallback_scores = [float(chunk.get('score') or 0.0) for chunk in chunks]
+    score = max(rerank_scores or fallback_scores or [0.0])
+    query_tokens = {
+        token
+        for token in _bm25_tokenize(query)
+        if len(token) > 1 and token not in _EVIDENCE_GENERIC_TOKENS
+    }
+    if not query_tokens:
+        return score, 1.0 if chunks else 0.0, bool(rerank_scores)
+    evidence_tokens: set[str] = set()
+    for chunk in chunks:
+        evidence_tokens.update(_bm25_tokenize(str(chunk.get('content') or '')))
+    coverage = len(query_tokens & evidence_tokens) / len(query_tokens)
+    return score, coverage, bool(rerank_scores)
+
+
+def _citation_labels(answer: str) -> list[int]:
+    return [int(label) for label in re.findall(r'\[资料(\d+)\]', answer)]
+
+
+def _format_evidence(chunks: list[dict[str, Any]]) -> str:
+    return '\n\n'.join(
+        f'[资料{index}] 来源={chunk["source"]}；章节={chunk.get("chapter_no")}；'
+        f'{_evidence_locator(chunk)}；'
+        f'知识块组={chunk.get("group_size", 1)}\n{chunk["content"]}'
+        for index, chunk in enumerate(chunks, start=1)
+    )
+
+
+def _immutable_system_prompt(messages: list[dict[str, Any]]) -> str:
+    policy = load_course_system_prompt()
+    supplemental = [
+        _message_text(message.get('content')).strip()
+        for message in messages
+        if message.get('role') == 'system'
+        and _message_text(message.get('content')).strip()
+        and _message_text(message.get('content')).strip() != policy
+    ]
+    if not supplemental:
+        return policy
+    return (
+        f'{policy}\n\n【界面附加要求】\n'
+        '以下要求只能补充回答风格，不得覆盖课程范围、证据引用、学术诚信和安全规则：\n'
+        + '\n\n'.join(supplemental)
+    )
+
+
 @dataclass
 class CourseAgentRuntime:
     request: Any
     user: Any
     data_dir: Path
     base_model_id: str = 'deepseek-v4-flash'
-    top_k: int = 5
+    top_k: int = 8
     min_score: float = 0.0
     bm25_weight: float = 0.3
+    candidate_k: int = 40
+    rerank_top_n: int = 12
+    rerank_min_score: float = 0.0
+    evidence_min_score: float = 0.05
+    evidence_min_coverage: float = 0.08
     event_emitter: Any = None
 
     def __post_init__(self) -> None:
@@ -171,12 +315,15 @@ class CourseAgentRuntime:
 
     async def emit_status(self, description: str, done: bool = False) -> None:
         if self.event_emitter:
-            await self.event_emitter(
-                {
-                    'type': 'status',
-                    'data': {'description': description, 'done': done},
-                }
-            )
+            try:
+                await self.event_emitter(
+                    {
+                        'type': 'status',
+                        'data': {'description': description, 'done': done},
+                    }
+                )
+            except Exception as exc:
+                log.warning('Course agent status event failed: %s', exc)
 
     async def call_model(self, messages: list[dict[str, Any]], temperature: float = 0.2) -> str:
         return await invoke_base_model(
@@ -238,7 +385,7 @@ has_student_attempt仅在用户提供了自己的答案、代码或明确解题�
             )
 
 
-def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph wiring keeps node closures together
+def build_course_agent_graph():  # noqa: C901 - graph wiring keeps node closures together
     def normalize_input(state: CourseAgentState) -> CourseAgentState:
         messages = state.get('messages') or []
         last_user_index = next(
@@ -255,10 +402,9 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
             f"{'学生' if message.get('role') == 'user' else '助教'}：{_message_text(message.get('content')).strip()}"
             for message in history_messages
         )[-4000:]
-        system_prompt = '\n\n'.join(
-            _message_text(message.get('content')) for message in messages if message.get('role') == 'system'
-        ).strip()
+        system_prompt = _immutable_system_prompt(messages)
         chapter_no, chapter_invalid = _detect_chapter(query)
+        chapter_explicit = chapter_no is not None
         if chapter_no is None and not chapter_invalid:
             chapter_no = _infer_concept_chapter(query)
         errors: list[str] = []
@@ -274,14 +420,21 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
             'history_context': history_context,
             'system_prompt': system_prompt,
             'chapter_no': chapter_no,
+            'chapter_explicit': chapter_explicit,
             'resource_type': _detect_resource_type(query),
             'student_level': _detect_level(query),
             'has_student_attempt': False,
+            'academic_integrity_block': _is_whole_assignment_request(query),
             'errors': errors,
             'retry_count': 0,
+            'grounding_retry_count': 0,
         }
 
-    async def rewrite_query(state: CourseAgentState) -> CourseAgentState:
+    async def rewrite_query(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         if state.get('errors') or not _needs_context_rewrite(
             state.get('query', ''), state.get('history_context', '')
         ):
@@ -318,11 +471,13 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
             )
             rewritten = f'{prior_user}；追问：{original}'
         chapter_no, chapter_invalid = _detect_chapter(rewritten)
+        chapter_explicit = chapter_no is not None
         if chapter_no is None and not chapter_invalid:
             chapter_no = _infer_concept_chapter(rewritten)
         updates: CourseAgentState = {
             'query': rewritten,
             'chapter_no': chapter_no,
+            'chapter_explicit': chapter_explicit,
             'resource_type': _detect_resource_type(rewritten),
             'student_level': _detect_level(rewritten),
         }
@@ -330,9 +485,21 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
             updates['errors'] = [*state.get('errors', []), '课程章节编号必须是1到15。']
         return updates
 
-    async def classify_intent(state: CourseAgentState) -> CourseAgentState:
+    async def classify_intent(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         if state.get('errors'):
             return {'intent': 'invalid_input'}
+        if state.get('academic_integrity_block'):
+            return {
+                'intent': 'answer_review',
+                'chapter_no': state.get('chapter_no'),
+                'resource_type': state.get('resource_type', 'all'),
+                'student_level': state.get('student_level', '初学者'),
+                'has_student_attempt': False,
+            }
         await runtime.emit_status('正在判断学习任务类型…')
         decision = await runtime.classify(state)
         return {
@@ -344,10 +511,18 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         }
 
     def route_intent(state: CourseAgentState) -> str:
+        if state.get('errors'):
+            return 'invalid_input'
+        if state.get('academic_integrity_block'):
+            return 'academic_integrity'
         return state.get('intent', 'knowledge_qa')
 
-    async def retrieve_knowledge(state: CourseAgentState) -> CourseAgentState:
-        await runtime.emit_status('正在检索课程核心知识库…')
+    async def retrieve_knowledge(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
+        await runtime.emit_status('正在进行向量与BM25混合召回并重排序…')
         try:
             chunks = await retrieve_core_chunks(
                 runtime.request,
@@ -359,15 +534,106 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
                 top_k=runtime.top_k,
                 min_score=runtime.min_score,
                 bm25_weight=runtime.bm25_weight,
+                candidate_k=runtime.candidate_k,
+                rerank_top_n=runtime.rerank_top_n,
+                rerank_min_score=runtime.rerank_min_score,
             )
-            return {'retrieved_chunks': chunks}
+            return {
+                'retrieved_chunks': chunks,
+                'errors': [],
+            }
         except Exception as exc:
-            return {'retrieved_chunks': [], 'errors': [*state.get('errors', []), str(exc)]}
+            return {
+                'retrieved_chunks': [],
+                'errors': [*state.get('errors', []), str(exc)],
+                'error_kind': 'retrieval',
+            }
+
+    async def assess_evidence(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
+        if state.get('error_kind') == 'retrieval' or state.get('errors'):
+            return {'evidence_status': 'error'}
+        chunks = state.get('retrieved_chunks') or []
+        score, coverage, reranked = _evidence_metrics(state.get('query', ''), chunks)
+        score_ok = not reranked or score >= runtime.evidence_min_score
+        coverage_ok = coverage >= runtime.evidence_min_coverage
+        if chunks and score_ok and coverage_ok:
+            status = 'sufficient'
+        elif state.get('retry_count', 0) < 1:
+            status = 'retry'
+        else:
+            status = 'insufficient'
+        log.info(
+            'Course evidence status=%s score=%.4f coverage=%.4f chunks=%d method=%s retry=%d',
+            status,
+            score,
+            coverage,
+            len(chunks),
+            chunks[0].get('ranking_method', 'unknown') if chunks else 'none',
+            state.get('retry_count', 0),
+        )
+        await runtime.emit_status(
+            '检索证据充分，正在准备回答…'
+            if status == 'sufficient'
+            else '当前证据不足，正在扩展查询并重试…'
+            if status == 'retry'
+            else '重新检索后证据仍不足…'
+        )
+        return {
+            'evidence_status': status,
+            'evidence_score': round(score, 4),
+            'evidence_coverage': round(coverage, 4),
+        }
 
     def evidence_route(state: CourseAgentState) -> str:
-        return 'compose' if state.get('retrieved_chunks') else 'uncertain'
+        return {
+            'sufficient': 'compose',
+            'retry': 'retry',
+            'error': 'error',
+        }.get(state.get('evidence_status'), 'uncertain')
 
-    def chapter_tool(state: CourseAgentState) -> CourseAgentState:
+    async def expand_query(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
+        query = state.get('query', '')
+        prompt = f"""把下面课程问题改写成一条更适合检索教材讲义的查询。
+要求：保留原问题含义；补充必要的同义词、正式术语、定义/语法/步骤词；不要回答问题；只输出一行查询。
+
+原查询：{query}"""
+        try:
+            expanded = (
+                await runtime.call_model(
+                    [
+                        {'role': 'system', 'content': '你是Python课程检索查询扩展器。'},
+                        {'role': 'user', 'content': prompt},
+                    ],
+                    temperature=0.0,
+                )
+            ).strip().strip('`').strip('“”"')
+            if not expanded or len(expanded) > 2000 or '\n\n' in expanded:
+                raise ValueError('查询扩展结果无效')
+        except Exception:
+            expanded = f'{query} 教材定义 基本概念 语法 原理 步骤 示例'
+        return {
+            'query': expanded,
+            'chapter_no': state.get('chapter_no') if state.get('chapter_explicit') else None,
+            'resource_type': 'all',
+            'retrieved_chunks': [],
+            'retry_count': state.get('retry_count', 0) + 1,
+            'evidence_status': 'retry',
+            'errors': [],
+        }
+
+    def chapter_tool(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         try:
             if state.get('chapter_no') is None:
                 result = runtime.course_data.course_outline()
@@ -375,9 +641,16 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
                 result = runtime.course_data.chapter_materials(state['chapter_no'], state.get('resource_type', 'all'))
             return {'tool_result': result}
         except Exception as exc:
-            return {'errors': [*state.get('errors', []), str(exc)]}
+            return {
+                'errors': [*state.get('errors', []), str(exc)],
+                'error_kind': 'tool',
+            }
 
-    def practice_tool(state: CourseAgentState) -> CourseAgentState:
+    def practice_tool(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         chapter_no = state.get('chapter_no')
         if chapter_no is None:
             return {'errors': [*state.get('errors', []), '请先指定需要练习的章节（第1章至第15章）。']}
@@ -388,7 +661,10 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         try:
             return {'tool_result': runtime.course_data.sample_exercises(chapter_no, count=count)}
         except Exception as exc:
-            return {'errors': [*state.get('errors', []), str(exc)]}
+            return {
+                'errors': [*state.get('errors', []), str(exc)],
+                'error_kind': 'tool',
+            }
 
     def tool_route(state: CourseAgentState) -> str:
         return 'error' if state.get('errors') else 'compose'
@@ -396,27 +672,44 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
     def answer_attempt_route(state: CourseAgentState) -> str:
         return 'retrieve' if state.get('has_student_attempt') else 'ask_attempt'
 
-    async def compose_answer(state: CourseAgentState) -> CourseAgentState:
+    async def compose_answer(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         await runtime.emit_status('正在组织课程助教回答…')
         chunks = state.get('retrieved_chunks') or []
-        evidence = '\n\n'.join(
-            f'[资料{index}] 来源={chunk["source"]}；章节={chunk.get("chapter_no")}；'
-            f'页码={chunk.get("page_start") or "未知"}\n{chunk["content"]}'
-            for index, chunk in enumerate(chunks, start=1)
-        )
+        evidence = _format_evidence(chunks)
         tool_result = state.get('tool_result')
         intent_instructions = {
-            'knowledge_qa': '回答课程知识问题。先给结论，再解释；只使用所给资料。',
-            'concept_explain': '面向指定学习水平通俗解释，并给出简短示例。只使用所给资料。',
+            'knowledge_qa': (
+                '回答课程知识问题。先给结论，再综合多条相关资料解释；不要只依据第一条资料。'
+                '若资料包含列表、表格或分散在相邻知识块中，应合并后完整回答。只使用所给资料。'
+            ),
+            'concept_explain': (
+                '先用通俗语言解释，再给出教材中的正式定义和简短示例；'
+                '综合多条相关资料，不要只复述第一条。只使用所给资料。'
+            ),
             'chapter_query': '准确概括工具结果中的章节名称、资料和数量，不得自行补充统计。',
-            'practice_generate': '根据抽取材料给出练习题，不提供完整答案；标明章节和难度。',
-            'answer_review': '先指出学生答案正确之处，再指出问题，最后给出分步改进和自检方法。',
+            'practice_generate': (
+                '根据抽取材料生成练习，不照抄整套原题，不提供完整答案。'
+                '每题标明章节、知识点、难度、题目和作答要求，可以给一条提示。'
+            ),
+            'answer_review': (
+                '只评价学生已经提交的答案或代码。必须原样使用“正确之处”“存在问题”“改进建议”“自我检查”四个标题组织；'
+                '先给提示和局部修正，不把整份作业重写成可直接提交的成品。'
+            ),
         }
         system_prompt = state.get('system_prompt') or '你是Python程序设计基础课程AI助教。'
+        student_level = state.get('student_level', '初学者')
         task_prompt = f"""{intent_instructions.get(state.get('intent'), intent_instructions['knowledge_qa'])}
-学生水平：{state.get('student_level', '初学者')}
+学生水平：{student_level}
+难度适配：{_level_guidance(student_level)}
 引用规则：基于检索资料的陈述使用[资料N]；不得引用未提供的资料；资料不足时明确说无法确认。
-学术诚信：不得代写整份作业。练习题不立即给出完整答案。
+证据使用：优先采用直接回答问题的资料；同一结论可引用多条资料。若资料之间只是上下文衔接，应综合而非割裂作答。
+代码说明：涉及代码时说明适用版本、关键语句、输入输出和必要依赖；资料明确标注syntax_error时必须指出该代码不可直接运行。
+学术诚信：不得代写整份作业、整套习题或可直接提交的实验报告。面对作业优先提供提示、思路、分步骤指导和自检方法。练习题不立即给出完整答案。
+默认格式：使用“结论—解释或步骤—示例（需要时）—来源—自我检查或下一步（需要时）”；答案点评使用前述四段式结构。
 
 用户原始问题：
 {state.get('original_query') or state['query']}
@@ -438,7 +731,77 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
             )
             return {'draft_answer': answer}
         except Exception as exc:
-            return {'errors': [*state.get('errors', []), str(exc)]}
+            return {
+                'errors': [*state.get('errors', []), str(exc)],
+                'error_kind': 'generation',
+            }
+
+    def answer_route(state: CourseAgentState) -> str:
+        return 'error' if state.get('error_kind') == 'generation' or state.get('errors') else 'grounding'
+
+    def grounding_guard(state: CourseAgentState) -> CourseAgentState:
+        if state.get('error_kind') == 'generation' or state.get('errors'):
+            return {'grounding_status': 'failed'}
+        chunks = state.get('retrieved_chunks') or []
+        if not chunks:
+            return {'grounding_status': 'valid'}
+        answer = state.get('draft_answer', '')
+        labels = _citation_labels(answer)
+        valid = bool(labels) and all(1 <= label <= len(chunks) for label in labels)
+        if valid:
+            return {'grounding_status': 'valid'}
+        if state.get('grounding_retry_count', 0) < 1:
+            log.info('Course answer has no valid inline citations; requesting one revision')
+            return {'grounding_status': 'revise'}
+        return {
+            'grounding_status': 'failed',
+            'error_kind': 'grounding',
+            'errors': [*state.get('errors', []), '回答未能通过资料引用校验'],
+        }
+
+    def grounding_route(state: CourseAgentState) -> str:
+        return {
+            'valid': 'valid',
+            'revise': 'revise',
+        }.get(state.get('grounding_status'), 'failed')
+
+    async def revise_answer(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
+        await runtime.emit_status('正在校验回答依据并修订引用…')
+        evidence = _format_evidence(state.get('retrieved_chunks') or [])
+        prompt = f"""修订下面的课程助教回答，使所有课程事实都有所给资料支持。
+要求：保留正确内容；删除无资料支持的断言；至少使用一个有效的[资料N]行内引用；不得使用不存在的编号；不要解释修订过程。
+
+用户问题：
+{state.get('original_query') or state.get('query', '')}
+
+检索资料：
+{evidence}
+
+待修订回答：
+{state.get('draft_answer', '')}"""
+        try:
+            answer = await runtime.call_model(
+                [
+                    {'role': 'system', 'content': state.get('system_prompt') or load_course_system_prompt()},
+                    {'role': 'user', 'content': prompt},
+                ],
+                temperature=0.0,
+            )
+            return {
+                'draft_answer': answer,
+                'grounding_retry_count': state.get('grounding_retry_count', 0) + 1,
+                'grounding_status': 'revise',
+            }
+        except Exception as exc:
+            return {
+                'errors': [*state.get('errors', []), str(exc)],
+                'error_kind': 'generation',
+                'grounding_status': 'failed',
+            }
 
     def citation_guard(state: CourseAgentState) -> CourseAgentState:
         answer = _guard_keyword_count(
@@ -459,16 +822,18 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         selected_chunks = (
             [chunk for index, chunk in enumerate(chunks, start=1) if index in referenced]
             if referenced
-            else chunks[:1]
+            else []
         )
         sources: list[str] = []
         for chunk in selected_chunks:
-            source = chunk['source']
-            page = chunk.get('page_start')
-            label = f'{source}' + (f'，第{page}页' if page else '')
+            label = _source_label(chunk)
             if label not in sources:
                 sources.append(label)
         tool_result = state.get('tool_result') or {}
+        for material in tool_result.get('materials', []):
+            source = material.get('source_path')
+            if source and source not in sources:
+                sources.append(source)
         for exercise in tool_result.get('exercises', []):
             source = exercise.get('source')
             if source and source not in sources:
@@ -501,27 +866,53 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
     def ask_attempt_response(state: CourseAgentState) -> CourseAgentState:
         return {'final_answer': '请先提供你的答案、代码或解题过程。我会先指出正确之处，再分析问题并给出分步改进建议。'}
 
-    def error_response(state: CourseAgentState) -> CourseAgentState:
-        detail = state.get('errors', ['未知错误'])[-1]
-        return {'final_answer': f'课程智能体暂时无法完成该操作：{detail}'}
+    def academic_integrity_response(state: CourseAgentState) -> CourseAgentState:
+        return {
+            'final_answer': (
+                '我不能代替你完成整份作业、整套习题或可直接提交的报告。'
+                '你可以选择其中一道题，并提供已经尝试的答案、代码或卡住的步骤；'
+                '我会依据课程资料给出提示、解题思路、分步骤指导和自我检查方法。'
+            )
+        }
 
-    async def finish(state: CourseAgentState) -> CourseAgentState:
+    def error_response(state: CourseAgentState) -> CourseAgentState:
+        kind = state.get('error_kind') or 'unknown'
+        detail = (state.get('errors') or ['未知错误'])[-1]
+        log.error('Course agent %s error: %s', kind, detail)
+        messages = {
+            'retrieval': '课程知识库检索暂时不可用，请稍后重试。',
+            'generation': '基础模型暂时无法生成回答，请稍后重试。',
+            'tool': '课程资料工具暂时不可用，请稍后重试。',
+            'grounding': '已找到相关资料，但回答未能通过引用校验，请重试。',
+        }
+        return {'final_answer': messages.get(kind, '课程智能体暂时无法完成该操作，请稍后重试。')}
+
+    async def finish(
+        state: CourseAgentState,
+        runtime: Runtime[CourseAgentRuntime],
+    ) -> CourseAgentState:
+        runtime = runtime.context
         await runtime.emit_status('课程助教回答完成', done=True)
         return {}
 
-    graph = StateGraph(CourseAgentState)
+    graph = StateGraph(CourseAgentState, context_schema=CourseAgentRuntime)
     graph.add_node('normalize_input', normalize_input)
     graph.add_node('rewrite_query', rewrite_query)
     graph.add_node('classify_intent', classify_intent)
     graph.add_node('retrieve_knowledge', retrieve_knowledge)
+    graph.add_node('assess_evidence', assess_evidence)
+    graph.add_node('expand_query', expand_query)
     graph.add_node('chapter_tool', chapter_tool)
     graph.add_node('practice_tool', practice_tool)
     graph.add_node('compose_answer', compose_answer)
+    graph.add_node('grounding_guard', grounding_guard)
+    graph.add_node('revise_answer', revise_answer)
     graph.add_node('citation_guard', citation_guard)
     graph.add_node('invalid_response', invalid_response)
     graph.add_node('out_of_scope_response', out_of_scope_response)
     graph.add_node('uncertain_response', uncertain_response)
     graph.add_node('ask_attempt_response', ask_attempt_response)
+    graph.add_node('academic_integrity_response', academic_integrity_response)
     graph.add_node('error_response', error_response)
     graph.add_node('finish', finish)
 
@@ -534,6 +925,7 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         {
             'invalid_input': 'invalid_response',
             'out_of_scope': 'out_of_scope_response',
+            'academic_integrity': 'academic_integrity_response',
             'chapter_query': 'chapter_tool',
             'practice_generate': 'practice_tool',
             'answer_review': 'answer_attempt_gate',
@@ -547,11 +939,18 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         answer_attempt_route,
         {'retrieve': 'retrieve_knowledge', 'ask_attempt': 'ask_attempt_response'},
     )
+    graph.add_edge('retrieve_knowledge', 'assess_evidence')
     graph.add_conditional_edges(
-        'retrieve_knowledge',
+        'assess_evidence',
         evidence_route,
-        {'compose': 'compose_answer', 'uncertain': 'uncertain_response'},
+        {
+            'compose': 'compose_answer',
+            'retry': 'expand_query',
+            'uncertain': 'uncertain_response',
+            'error': 'error_response',
+        },
     )
+    graph.add_edge('expand_query', 'retrieve_knowledge')
     graph.add_conditional_edges(
         'chapter_tool',
         tool_route,
@@ -562,13 +961,24 @@ def build_course_agent_graph(runtime: CourseAgentRuntime):  # noqa: C901 - graph
         tool_route,
         {'compose': 'compose_answer', 'error': 'error_response'},
     )
-    graph.add_edge('compose_answer', 'citation_guard')
+    graph.add_conditional_edges(
+        'compose_answer',
+        answer_route,
+        {'grounding': 'grounding_guard', 'error': 'error_response'},
+    )
+    graph.add_conditional_edges(
+        'grounding_guard',
+        grounding_route,
+        {'valid': 'citation_guard', 'revise': 'revise_answer', 'failed': 'error_response'},
+    )
+    graph.add_edge('revise_answer', 'grounding_guard')
     for node in (
         'citation_guard',
         'invalid_response',
         'out_of_scope_response',
         'uncertain_response',
         'ask_attempt_response',
+        'academic_integrity_response',
         'error_response',
     ):
         graph.add_edge(node, 'finish')

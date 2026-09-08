@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
 import threading
+from functools import lru_cache
 from typing import Any
 
 from .course_data import CHAPTER_TITLES, CourseData, normalize_resource_type
@@ -38,6 +41,9 @@ _NEIGHBOR_CONTEXT_MARKERS = (
 )
 _CORPUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 _CORPUS_CACHE_LOCK = threading.Lock()
+_DEFAULT_RERANK_MODEL = 'BAAI/bge-reranker-v2-m3'
+_DEFAULT_RERANK_URL = 'https://api.siliconflow.cn/v1/rerank'
+log = logging.getLogger(__name__)
 
 
 def _is_exhaustive_request(query: str) -> bool:
@@ -216,6 +222,227 @@ def _needs_neighbor_context(query: str) -> bool:
     return any(marker in lowered for marker in _NEIGHBOR_CONTEXT_MARKERS)
 
 
+def _dynamic_context_limit(query: str, maximum: int) -> int:
+    """Choose how many evidence groups the answer model receives.
+
+    A single result is too brittle for teaching questions, while sending every
+    candidate adds noise.  Definitions stay concise; lists, comparisons and
+    multi-step/code questions receive more independently reranked evidence.
+    """
+    bounded_maximum = max(1, min(maximum, 12))
+    lowered = query.lower()
+    if _is_exhaustive_request(query) or any(
+        marker in lowered for marker in ('比较', '区别', '异同', '分别', '归纳', '总结')
+    ):
+        desired = 8
+    elif any(
+        marker in lowered
+        for marker in ('代码', '示例', '步骤', '过程', '流程', '如何', '怎么', '实现', '调用')
+    ):
+        desired = 5
+    elif _definition_subject(query):
+        desired = 3
+    else:
+        desired = 5
+    return min(desired, bounded_maximum)
+
+
+@lru_cache(maxsize=4)
+def _external_reranker(
+    api_key: str,
+    url: str,
+    model: str,
+    timeout: int,
+) -> Any:
+    from open_webui.retrieval.models.external import ExternalReranker
+
+    return ExternalReranker(
+        api_key=api_key,
+        url=url,
+        model=model,
+        timeout=timeout,
+    )
+
+
+def _configured_reranking_function(request: Any, user: Any) -> tuple[Any, str]:
+    """Resolve the course reranker without exposing or persisting its API key."""
+    api_key = os.getenv('COURSE_RERANK_API_KEY', '').strip()
+    if api_key:
+        url = os.getenv('COURSE_RERANK_API_URL', _DEFAULT_RERANK_URL).strip()
+        model = os.getenv('COURSE_RERANK_MODEL', _DEFAULT_RERANK_MODEL).strip()
+        try:
+            timeout = max(1, int(os.getenv('COURSE_RERANK_TIMEOUT', '30')))
+        except ValueError:
+            timeout = 30
+        reranker = _external_reranker(api_key, url, model, timeout)
+        return (
+            lambda query, documents: reranker.predict(
+                [(query, document.page_content) for document in documents],
+                user=user,
+            ),
+            model,
+        )
+
+    app = getattr(request, 'app', None)
+    state = getattr(app, 'state', None)
+    native = getattr(state, 'RERANKING_FUNCTION', None)
+    if native is None:
+        return None, ''
+
+    def call_native(query: str, documents: list[Any]) -> Any:
+        try:
+            return native(query, documents, user=user)
+        except TypeError:
+            return native(query, documents)
+
+    return call_native, 'open-webui-reranker'
+
+
+async def _rerank_candidates(
+    request: Any,
+    user: Any,
+    query: str,
+    candidates: list[tuple[str, str, dict[str, Any], float]],
+    limit: int,
+) -> tuple[list[tuple[str, str, dict[str, Any], float, float, float | None]], str]:
+    """Rerank hybrid candidates, falling back to their RRF order on any error."""
+    fallback = [
+        (item_id, content, metadata, score, score, None)
+        for item_id, content, metadata, score in candidates[:limit]
+    ]
+    reranking_function, model = _configured_reranking_function(request, user)
+    if reranking_function is None or not candidates:
+        return fallback, 'hybrid_rrf'
+
+    from langchain_core.documents import Document
+
+    documents = [
+        Document(page_content=content, metadata={'candidate_id': item_id})
+        for item_id, content, _, _ in candidates
+    ]
+    try:
+        scores = await asyncio.to_thread(reranking_function, query, documents)
+        if scores is None:
+            raise RuntimeError('重排序服务未返回分数')
+        normalized_scores = scores.tolist() if hasattr(scores, 'tolist') else list(scores)
+        if len(normalized_scores) != len(candidates):
+            raise RuntimeError(
+                f'重排序分数数量不匹配：期望{len(candidates)}，实际{len(normalized_scores)}'
+            )
+        reranked = sorted(
+            (
+                (
+                    item_id,
+                    content,
+                    metadata,
+                    float(normalized_scores[index]),
+                    fusion_score,
+                    float(normalized_scores[index]),
+                )
+                for index, (item_id, content, metadata, fusion_score) in enumerate(candidates)
+            ),
+            key=lambda item: (-item[3], -item[4], item[0]),
+        )
+        return reranked[:limit], model or 'reranker'
+    except Exception as exc:
+        log.warning('Course reranking failed; using hybrid RRF order: %s', exc)
+        return fallback, 'hybrid_rrf_fallback'
+
+
+def _adjacent_member_ids(
+    anchor_id: str,
+    anchor_metadata: dict[str, Any],
+    rows: dict[str, tuple[str, dict[str, Any]]],
+    ranked_ids: set[str],
+    used: set[str],
+    include_neighbors: bool,
+) -> list[str]:
+    file_id = anchor_metadata.get('file_id')
+    ordinal = anchor_metadata.get('ordinal')
+    if not file_id or not isinstance(ordinal, int):
+        return [anchor_id]
+    adjacent = [
+        item_id
+        for item_id, (_, metadata) in rows.items()
+        if item_id != anchor_id
+        and item_id not in used
+        and metadata.get('file_id') == file_id
+        and isinstance(metadata.get('ordinal'), int)
+        and abs(metadata['ordinal'] - ordinal) == 1
+        and (include_neighbors or item_id in ranked_ids)
+    ]
+    return [anchor_id, *adjacent]
+
+
+def _assemble_evidence_groups(
+    ranked: list[tuple[str, str, dict[str, Any], float, float, float | None]],
+    rows: dict[str, tuple[str, dict[str, Any]]],
+    query: str,
+    limit: int,
+) -> list[tuple[str, dict[str, Any], float, float, float | None]]:
+    """Group adjacent chunks so each final item is a coherent evidence passage."""
+    if not ranked:
+        return []
+    ranked_ids = {item[0] for item in ranked}
+    used: set[str] = set()
+    groups: list[tuple[str, dict[str, Any], float, float, float | None]] = []
+    include_neighbors = _needs_neighbor_context(query)
+
+    for anchor_id, anchor_content, anchor_metadata, score, fusion_score, rerank_score in ranked:
+        if anchor_id in used:
+            continue
+        ordinal = anchor_metadata.get('ordinal')
+        member_ids = _adjacent_member_ids(
+            anchor_id,
+            anchor_metadata,
+            rows,
+            ranked_ids,
+            used,
+            include_neighbors,
+        )
+
+        member_ids.sort(
+            key=lambda item_id: (
+                rows.get(item_id, ('', {}))[1].get('ordinal')
+                if isinstance(rows.get(item_id, ('', {}))[1].get('ordinal'), int)
+                else ordinal or 0
+            )
+        )
+        members = [rows.get(item_id, ('', {})) for item_id in member_ids]
+        contents = [content for content, _ in members if content]
+        if not contents:
+            contents = [anchor_content]
+        merged_content = '\n\n--- 相邻知识块 ---\n\n'.join(dict.fromkeys(contents))
+        merged_metadata = dict(anchor_metadata)
+        pages_start = [metadata.get('page_start') for _, metadata in members if metadata.get('page_start')]
+        pages_end = [
+            metadata.get('page_end') or metadata.get('page_start')
+            for _, metadata in members
+            if metadata.get('page_end') or metadata.get('page_start')
+        ]
+        if pages_start:
+            merged_metadata['page_start'] = min(pages_start)
+        if pages_end:
+            merged_metadata['page_end'] = max(pages_end)
+        lines_start = [metadata.get('line_start') for _, metadata in members if metadata.get('line_start')]
+        lines_end = [
+            metadata.get('line_end') or metadata.get('line_start')
+            for _, metadata in members
+            if metadata.get('line_end') or metadata.get('line_start')
+        ]
+        if lines_start:
+            merged_metadata['line_start'] = min(lines_start)
+        if lines_end:
+            merged_metadata['line_end'] = max(lines_end)
+        merged_metadata['group_size'] = len(member_ids)
+        merged_metadata['chunk_ids'] = ','.join(member_ids)
+        used.update(member_ids)
+        groups.append((merged_content, merged_metadata, score, fusion_score, rerank_score))
+        if len(groups) >= limit:
+            break
+    return groups
+
+
 def _expand_neighbor_context(
     ranked: list[tuple[str, float]],
     rows: dict[str, tuple[str, dict[str, Any]]],
@@ -357,8 +584,11 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
     top_k: int = 5,
     min_score: float = 0.0,
     bm25_weight: float = 0.3,
+    candidate_k: int = 40,
+    rerank_top_n: int = 12,
+    rerank_min_score: float = 0.0,
 ) -> list[RetrievedChunk]:
-    """Hybrid-search only the active core collection with vector and BM25 ranks."""
+    """Hybrid-retrieve, rerank and group evidence from the active core collection."""
     from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
 
     _, active = course_data.paths()
@@ -378,11 +608,15 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
         filters.append({'resource_type': {'$eq': normalized_type}})
     where = filters[0] if len(filters) == 1 else {'$and': filters} if filters else None
 
-    result_limit = max(1, min(top_k, 12))
-    candidate_limit = min(max(result_limit * 4, 20), 48)
+    result_limit = _dynamic_context_limit(query, top_k)
+    candidate_limit = min(max(candidate_k, result_limit * 4, 20), 80)
+    rerank_limit = min(max(rerank_top_n, result_limit), candidate_limit)
     lexical_terms = _lexical_query_terms(query)
 
-    def search() -> list[tuple[str, dict[str, Any], float]]:
+    def search() -> tuple[
+        list[tuple[str, str, dict[str, Any], float]],
+        dict[str, tuple[str, dict[str, Any]]],
+    ]:
         import chromadb
 
         client = chromadb.PersistentClient(path=active['vector_path'])
@@ -399,7 +633,7 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
         corpus_documents = corpus['documents']
         corpus_metadatas = corpus['metadatas']
         if not corpus_ids:
-            return []
+            return [], {}
 
         vector_ids: list[str] = []
         if vector is not None:
@@ -453,8 +687,10 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
                     item_id
                     for item_id, score in exact_ranked
                     if score >= max(8.0, strongest_score * 0.6)
-                ][:result_limit]
-                return [(*rows[item_id], 1.0) for item_id in trusted_ids]
+                ][:rerank_limit]
+                return [
+                    (item_id, *rows[item_id], 1.0) for item_id in trusted_ids
+                ], rows
 
         fused = _weighted_rrf(
             vector_ids,
@@ -464,17 +700,35 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
         )
         fused = _promote_precise_bm25_anchor(query, fused, bm25_ids)
         fused = _promote_definition_anchor(query, fused, bm25_ids, rows)
-        fused = _expand_neighbor_context(fused, rows, query, result_limit)
-        return [(*rows[item_id], score) for item_id, score in fused if item_id in rows]
+        return [
+            (item_id, *rows[item_id], score)
+            for item_id, score in fused
+            if item_id in rows
+        ], rows
 
-    candidates = await asyncio.to_thread(search)
+    candidates, rows = await asyncio.to_thread(search)
+    reranked, ranking_method = await _rerank_candidates(
+        request,
+        user,
+        query,
+        candidates,
+        rerank_limit,
+    )
+    evidence_groups = _assemble_evidence_groups(
+        reranked,
+        rows,
+        query,
+        result_limit,
+    )
     chunks: list[RetrievedChunk] = []
     seen: set[tuple[str, int | None, str]] = set()
 
-    for content, metadata, score in candidates:
+    for content, metadata, score, fusion_score, rerank_score in evidence_groups:
         if not content:
             continue
         if score < min_score:
+            continue
+        if rerank_score is not None and rerank_score < rerank_min_score:
             continue
         source = metadata.get('source') or metadata.get('source_path') or '课程知识库'
         key = (source, metadata.get('page_start'), content[:80])
@@ -491,9 +745,15 @@ async def retrieve_core_chunks(  # noqa: C901 - vector and lexical paths share f
                 'resource_type': metadata.get('resource_type', ''),
                 'page_start': metadata.get('page_start'),
                 'page_end': metadata.get('page_end'),
+                'line_start': metadata.get('line_start'),
+                'line_end': metadata.get('line_end'),
                 'ordinal': metadata.get('ordinal'),
                 'section_title': metadata.get('section_title', ''),
                 'score': round(score, 4),
+                'fusion_score': round(fusion_score, 4),
+                'rerank_score': round(rerank_score, 4) if rerank_score is not None else None,
+                'ranking_method': ranking_method,
+                'group_size': metadata.get('group_size', 1),
             }
         )
         if len(chunks) >= result_limit:

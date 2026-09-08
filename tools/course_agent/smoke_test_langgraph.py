@@ -25,6 +25,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--token", default=None)
+    parser.add_argument(
+        "--tail-only",
+        action="store_true",
+        help="Only validate out-of-scope and academic-integrity routing",
+    )
     args = parser.parse_args(argv)
 
     data_dir = Path(args.data_dir).resolve()
@@ -48,6 +53,29 @@ def main(argv: list[str] | None = None) -> int:
             (choices[0].get("message") or {}).get("content") if choices else ""
         ) or ""
         return answer, response
+
+    if args.tail_only:
+        scope_answer, scope_response = chat("请介绍今天的足球比赛结果。")
+        if "超出了" not in scope_answer or "范围" not in scope_answer:
+            print(json.dumps(scope_response, ensure_ascii=False, indent=2), file=sys.stderr)
+            raise RuntimeError("LangGraph智能体未提示课程范围外问题")
+        integrity_answer, integrity_response = chat("请帮我完成整份第6章作业并给出全部答案。")
+        if "不能代替你完成整份作业" not in integrity_answer or "提供已经尝试" not in integrity_answer:
+            print(json.dumps(integrity_response, ensure_ascii=False, indent=2), file=sys.stderr)
+            raise RuntimeError("LangGraph智能体未拦截整份作业代做请求")
+        print(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "model": LANGGRAPH_PIPE_ID,
+                    "out_of_scope": scope_answer,
+                    "academic_integrity": integrity_answer,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     chapter_answer, chapter_response = chat(
         "第6章叫什么？其中示例代码有多少个知识块？只报告课程目录查询结果。"
@@ -129,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if "元组" not in follow_up_answer or any(
         marker in follow_up_answer
-        for marker in ("无法判断", "无法确认", "无法确定后者", "正则表达式")
+        for marker in ("无法判断后者", "无法确定后者", "正则表达式")
     ):
         print(json.dumps(follow_up_response, ensure_ascii=False, indent=2), file=sys.stderr)
         raise RuntimeError("LangGraph智能体未正确解析多轮追问中的“后者”")
@@ -147,6 +175,52 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(pickle_response, ensure_ascii=False, indent=2), file=sys.stderr)
         raise RuntimeError("LangGraph智能体未召回pickle流程的相邻知识块")
 
+    beginner_answer, beginner_response = chat(
+        "我是零基础学生，请用通俗类比解释for循环，并给一个最小代码示例和资料来源。"
+    )
+    if (
+        "for" not in beginner_answer
+        or "```" not in beginner_answer
+        or "来源" not in beginner_answer
+        or "第03章" not in beginner_answer
+    ):
+        print(json.dumps(beginner_response, ensure_ascii=False, indent=2), file=sys.stderr)
+        raise RuntimeError("LangGraph智能体未完成零基础难度适配或示例代码回答")
+
+    practice_answer, practice_response = chat(
+        "请根据第6章资料生成1道初学者练习题，只给一条提示，不要给完整答案。"
+    )
+    if (
+        "第6章" not in practice_answer.replace("第 6 章", "第6章")
+        or "提示" not in practice_answer
+        or "第06章" not in practice_answer
+    ):
+        print(json.dumps(practice_response, ensure_ascii=False, indent=2), file=sys.stderr)
+        raise RuntimeError("LangGraph智能体未完成指定章节练习生成或来源标注")
+
+    review_answer, review_response = chat(
+        "请分析我的答案。题目是编写两数相加函数，我写的代码是：```python\ndef add(a, b):\n    return a - b\n```"
+    )
+    review_dimensions = (
+        "正确" in review_answer,
+        "问题" in review_answer or "不符合" in review_answer,
+        "改进建议" in review_answer,
+        "自我检查" in review_answer,
+    )
+    if not all(review_dimensions) or "来源" not in review_answer:
+        print(json.dumps(review_response, ensure_ascii=False, indent=2), file=sys.stderr)
+        raise RuntimeError("LangGraph智能体未按四段式结构分析学生答案")
+
+    scope_answer, scope_response = chat("请介绍今天的足球比赛结果。")
+    if "超出了" not in scope_answer or "范围" not in scope_answer:
+        print(json.dumps(scope_response, ensure_ascii=False, indent=2), file=sys.stderr)
+        raise RuntimeError("LangGraph智能体未提示课程范围外问题")
+
+    integrity_answer, integrity_response = chat("请帮我完成整份第6章作业并给出全部答案。")
+    if "不能代替你完成整份作业" not in integrity_answer or "提供已经尝试" not in integrity_answer:
+        print(json.dumps(integrity_response, ensure_ascii=False, indent=2), file=sys.stderr)
+        raise RuntimeError("LangGraph智能体未拦截整份作业代做请求")
+
     print(
         json.dumps(
             {
@@ -158,6 +232,11 @@ def main(argv: list[str] | None = None) -> int:
                 "keywords_query": keywords_answer,
                 "follow_up_query": follow_up_answer,
                 "pickle_query": pickle_answer,
+                "beginner_adaptation": beginner_answer,
+                "practice_generation": practice_answer,
+                "answer_review": review_answer,
+                "out_of_scope": scope_answer,
+                "academic_integrity": integrity_answer,
             },
             ensure_ascii=False,
             indent=2,

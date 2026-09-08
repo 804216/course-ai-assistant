@@ -21,6 +21,7 @@ $backendDir = Join-Path $webuiRoot 'backend'
 $venvDir = Join-Path $webuiRoot '.venv'
 $openWebuiExe = Join-Path $venvDir 'Scripts\open-webui.exe'
 $secretFile = Join-Path $deployRoot 'webui_secret_key.txt'
+$localEnvExample = Join-Path $webuiRoot '.env.example'
 
 foreach ($dir in @($dataDir, $cacheDir, $logsDir, $tempDir, $staticDir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -51,6 +52,43 @@ $env:TORCH_HOME = Join-Path $cacheDir 'torch'
 $env:MPLCONFIGDIR = Join-Path $cacheDir 'matplotlib'
 $env:NLTK_DATA = Join-Path $cacheDir 'nltk_data'
 $env:PYTHONUTF8 = '1'
+
+# Course-agent reranking uses the SiliconFlow-compatible endpoint.  The local
+# key currently lives in .env.example as requested; copy it into this process
+# only, never print it or persist it in Open WebUI's database.
+if ([string]::IsNullOrWhiteSpace($env:COURSE_RERANK_API_KEY) -and (Test-Path -LiteralPath $localEnvExample)) {
+    $rerankLine = Get-Content -LiteralPath $localEnvExample |
+        Where-Object { $_ -match '^\s*rerank-key\s*=' } |
+        Select-Object -Last 1
+    if ($rerankLine -match '^\s*rerank-key\s*=\s*(.*)\s*$') {
+        $rerankKey = $Matches[1].Trim()
+        if (
+            $rerankKey.Length -ge 2 -and
+            (($rerankKey.StartsWith("'") -and $rerankKey.EndsWith("'")) -or
+             ($rerankKey.StartsWith('"') -and $rerankKey.EndsWith('"')))
+        ) {
+            $rerankKey = $rerankKey.Substring(1, $rerankKey.Length - 2)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($rerankKey)) {
+            $env:COURSE_RERANK_API_KEY = $rerankKey
+        }
+    }
+}
+$env:COURSE_RERANK_API_URL = if ([string]::IsNullOrWhiteSpace($env:COURSE_RERANK_API_URL)) {
+    'https://api.siliconflow.cn/v1/rerank'
+} else {
+    $env:COURSE_RERANK_API_URL
+}
+$env:COURSE_RERANK_MODEL = if ([string]::IsNullOrWhiteSpace($env:COURSE_RERANK_MODEL)) {
+    'BAAI/bge-reranker-v2-m3'
+} else {
+    $env:COURSE_RERANK_MODEL
+}
+$env:COURSE_RERANK_TIMEOUT = if ([string]::IsNullOrWhiteSpace($env:COURSE_RERANK_TIMEOUT)) {
+    '30'
+} else {
+    $env:COURSE_RERANK_TIMEOUT
+}
 
 # The shared .venv is an editable install; prefer the current checkout's source.
 if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {

@@ -58,6 +58,7 @@ def test_external_collection(
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
+    project_root = Path(__file__).resolve().parents[2]
     data_dir = Path(args.data_dir).resolve()
     active = json.loads(
         (data_dir / "course_kb" / "active.json").read_text(encoding="utf-8")
@@ -79,6 +80,25 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
                 "SELECT parse_status, COUNT(*) FROM source_file GROUP BY parse_status"
             )
         )
+        source_count = catalog.execute("SELECT COUNT(*) FROM source_file").fetchone()[0]
+        source_types = dict(
+            catalog.execute(
+                "SELECT resource_type, COUNT(*) FROM source_file GROUP BY resource_type"
+            )
+        )
+        source_extensions = dict(
+            catalog.execute(
+                "SELECT extension, COUNT(*) FROM source_file GROUP BY extension"
+            )
+        )
+        chapter_groups = dict(
+            catalog.execute(
+                "SELECT chapter_no, COUNT(*) FROM source_file GROUP BY chapter_no ORDER BY chapter_no"
+            )
+        )
+        unclassified_sources = catalog.execute(
+            "SELECT COUNT(*) FROM source_file WHERE chapter_no IS NULL"
+        ).fetchone()[0]
         chunk_roles = dict(
             catalog.execute(
                 "SELECT collection_role, COUNT(*) FROM chunk GROUP BY collection_role"
@@ -98,6 +118,34 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"目录数据库状态异常：build={build_status}, sources={source_status}"
         )
+
+    required_core_types = {"lecture", "exercise_question", "code"}
+    available_core_types = set(source_types) - {"exercise_answer"}
+    if source_count < 8:
+        raise RuntimeError(f"课程资料文件不足8个：{source_count}")
+    if len(available_core_types) < 3 or not required_core_types.issubset(available_core_types):
+        raise RuntimeError(f"课程资料类型不足或缺少讲义/习题/代码：{sorted(available_core_types)}")
+    if unclassified_sources or len(chapter_groups) < 2:
+        raise RuntimeError(
+            f"课程资料未按章节或模块完整分类：unclassified={unclassified_sources}, groups={len(chapter_groups)}"
+        )
+
+    prompt = (project_root / "tools" / "course_kb" / "assistant_prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    prompt_clauses = {
+        "identity": "AI 助教",
+        "course_scope": "课程范围",
+        "answer_format": "默认回答结构",
+        "citation": "引用必须",
+        "academic_integrity": "不得直接代替学生完成整份作业",
+        "uncertainty": "根据现有课程资料无法确认",
+    }
+    missing_prompt_clauses = [
+        name for name, marker in prompt_clauses.items() if marker not in prompt
+    ]
+    if missing_prompt_clauses:
+        raise RuntimeError(f"课程助教系统提示词缺少验收条款：{missing_prompt_clauses}")
 
     import chromadb
 
@@ -240,7 +288,6 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     if tool_api.get("id") != COURSE_TOOL_ID:
         raise RuntimeError("课程工具未出现在 Open WebUI 工具接口中")
 
-    project_root = Path(__file__).resolve().parents[2]
     import sys
 
     sys.path.insert(0, str(project_root))
@@ -284,6 +331,18 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "health": health,
         "build_id": active["build_id"],
         "source_status": source_status,
+        "course_requirements": {
+            "source_files": source_count,
+            "minimum_source_files": 8,
+            "source_file_requirement_passed": source_count >= 8,
+            "resource_types": source_types,
+            "core_resource_type_count": len(available_core_types),
+            "required_core_types_present": sorted(required_core_types),
+            "extensions": source_extensions,
+            "chapter_groups": chapter_groups,
+            "unclassified_sources": unclassified_sources,
+            "system_prompt_clauses": sorted(prompt_clauses),
+        },
         "chunk_roles": chunk_roles,
         "asset_count": asset_count,
         "vector_counts": vector_counts,

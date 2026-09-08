@@ -21,9 +21,15 @@ class RetrievedChunk(TypedDict, total=False):
     resource_type: str
     page_start: int
     page_end: int
+    line_start: int
+    line_end: int
     ordinal: int
     section_title: str
     score: float
+    fusion_score: float
+    rerank_score: float | None
+    ranking_method: str
+    group_size: int
 
 
 class CourseAgentState(TypedDict, total=False):
@@ -34,12 +40,20 @@ class CourseAgentState(TypedDict, total=False):
     system_prompt: str
     intent: CourseIntent
     chapter_no: int | None
+    chapter_explicit: bool
     resource_type: str
     student_level: str
     has_student_attempt: bool
+    academic_integrity_block: bool
     retrieved_chunks: list[RetrievedChunk]
+    evidence_status: Literal['sufficient', 'retry', 'insufficient', 'error']
+    evidence_score: float
+    evidence_coverage: float
     tool_result: dict[str, Any]
     draft_answer: str
+    grounding_status: Literal['valid', 'revise', 'failed']
     final_answer: str
     errors: list[str]
+    error_kind: Literal['retrieval', 'generation', 'tool', 'grounding']
     retry_count: int
+    grounding_retry_count: int
